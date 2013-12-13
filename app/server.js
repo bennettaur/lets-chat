@@ -18,6 +18,7 @@ var moment = require('moment');
 var passport = require('passport');
 var LocalStrategy = require('passport-local').Strategy;
 var knox = require('knox');
+var KerberosStrategy = require('passport-kerberos').Strategy;
 
 // App stuff
 var ChatServer = require('./chat.js');
@@ -47,8 +48,8 @@ var Server = function(config) {
     self.mongoURL = self.config.db_url || 'mongodb://'
         + self.config.db_user
         + ':' + self.config.db_password
-        + '@' + self.config.db_host 
-        + ':' + self.config.db_port 
+        + '@' + self.config.db_host
+        + ':' + self.config.db_port
         + '/' + self.config.db_name;
 
     // Create express app
@@ -71,7 +72,7 @@ var Server = function(config) {
             key: 'express.sid',
             cookie: {
                 httpOnly: false // We have to turn off httpOnly for websockets
-            }, 
+            },
             secret: self.config.cookie_secret,
             store: self.sessionStore
         }));
@@ -98,7 +99,43 @@ var Server = function(config) {
 
     });
 
+
     // Authentication
+    passport.use(new KerberosStrategy({
+            usernameField: 'email',
+            passwordField: 'password'
+        },
+        function (uid, done) {
+            console.log('searching for user');
+
+
+
+            models.user.findOne({ username: username }, function (err, user) {
+                if (err) {
+                    console.log('Error searching for user!!');
+                    return done(err);
+                }
+                if (!user) {
+                    console.log('No user found attempting to create authenticated kerberos user');
+                    user = new models.user({
+                        username: username,
+                        displayName: username
+                    });
+                    user.save(function (err, user) {
+                        if (err) {
+                            console.log("Error creating user: " + err);
+                        }
+                    });
+                    if (!user) {
+                        console.log('user var still false after creating user');
+                        return done(null, false);
+                    }
+                }
+                return done(null, user, self.config.realm);
+            });
+        }
+    ));
+
     passport.use(new LocalStrategy({
             usernameField: 'email',
             passwordField: 'password'
@@ -124,7 +161,7 @@ var Server = function(config) {
     });
     passport.deserializeUser(function(id, done) {
         models.user.findOne({
-            _id: id 
+            _id: id
         }).exec(function(err, user) {
             done(err, user);
         });
@@ -192,11 +229,13 @@ var Server = function(config) {
     //
     self.app.namespace('/ajax', function() {
         //
-        // Login
+        // Kerberos Login
         //
-        self.app.post('/login', function(req, res) {
-            passport.authenticate('local', function(err, user, info) {
+        self.app.post('/login', function(req, res, next) {
+            console.log('attempting kerberos auth with ' + req.toString());
+            passport.authenticate('kerberos', function(err, user, info) {
                 if (err) {
+                    console.log('kerberos auth failed:\nError: ' + err + '\nInfo: ' + info);
                     res.send({
                         status: 'error',
                         message: 'Some fields did not validate',
@@ -205,10 +244,8 @@ var Server = function(config) {
                     return;
                 }
                 if (!user) {
-                    res.send({
-                        status: 'error',
-                        message: 'Incorrect login credentials.'
-                    });
+                    console.log('kerberos auth failed, no user returned:\nUser: ' + user + "\nInfo: " + info);
+                    next();
                     return;
                 }
                 req.login(user, function(err) {
@@ -224,8 +261,47 @@ var Server = function(config) {
                         message: 'Logging you in...'
                     });
                 });
+            })(req, res, next);
+        }, function(req, res) {
+            console.log('attempting local auth with ' + req.toString());
+            passport.authenticate('local', function(err, user, info) {
+                if (err) {
+                    console.log("Error performing local auth:\nError: " + err + "\nInfo: " + info);
+                    res.send({
+                        status: 'error',
+                        message: 'Some fields did not validate',
+                        errors: err
+                    });
+                    return;
+                }
+                if (!user) {
+                    console.log("Error performing local auth, no user returned:\nInfo: " + info);
+                    res.send({
+                        status: 'error',
+                        message: 'Incorrect login credentials.'
+                    });
+                    return;
+                }
+                req.login(user, function(err) {
+                    console.log('Auth success, attempting to log you in');
+                    if (err) {
+                        console.log("Error logging you in:\nError: " + err);
+                        res.send({
+                            status: 'error',
+                            message: 'There were problems logging you in.'
+                        });
+                        return;
+                    }
+                    console.log('Login success, letting you know with ' + res.toString());
+                    res.send({
+                        status: 'success',
+                        message: 'Logging you in...'
+                    });
+                });
             })(req, res);
+            console.log('attempted local auth... what happened?');
         });
+
         //
         // Register
         //
@@ -399,7 +475,7 @@ var Server = function(config) {
                     });
                     return;
                 }
-                
+
                 // Lets see if this room exists
                 models.room.findOne({
                     '_id': roomID
@@ -481,9 +557,9 @@ var Server = function(config) {
                                 status: 'success',
                                 message: savedFile.name + ' has been saved!',
                                 url: url
-                            }); 
+                            });
                         });
-                    });  
+                    });
 
                 });
             });
