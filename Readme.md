@@ -16,6 +16,8 @@ A self-hosted chat app for small teams.
 * File uploads
 * SSL/TLS
 * MIT Licensed
+* Kerberos Authentication
+* Auto build new users using LDAP
 
 ## Upcoming Features
 
@@ -43,7 +45,7 @@ Install node dependencies
 npm install
 ```
 
-Create a settings file (make sure to edit if you need to). 
+Create a settings file (make sure to edit if you need to).
 
 ```
 cp settings.js.sample settings.js
