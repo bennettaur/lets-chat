@@ -19,7 +19,7 @@ var passport = require('passport');
 var LocalStrategy = require('passport-local').Strategy;
 var knox = require('knox');
 var KerberosStrategy = require('passport-kerberos').Strategy;
-var LDAP = require('LDAP');
+var ldap = require('ldapjs');
 
 // App stuff
 var ChatServer = require('./chat.js');
@@ -44,6 +44,16 @@ var Server = function(config) {
     var self = this;
 
     self.config = config;
+
+    // Load LDAP certs if LDAP enabled
+    if ((self.config.ldap.authorization || self.config.ldap.authorization) && self.config.ldap.server_certs !== undefined) {
+        var certs = [];
+        for (var i in self.config.ldap.server_certs) {
+            certs.push(fs.readFileSync(self.config.ldap.server_certs[i], 'utf-8'));
+        }
+
+        self.config.ldap.connect_settings.tlsOptions.ca = certs;
+    }
 
     // Mongo URL
     self.mongoURL = self.config.db_url || 'mongodb://'
@@ -100,87 +110,178 @@ var Server = function(config) {
 
     });
 
+    var findOrCreateFromLDAP = function (ldapEntry, callback) {
+        models.user.findOne({
+            'uid': ldapEntry[self.config.ldap.field_mappings.uid]
+        }, function (err, user) {
+            if (err) {
+                return callback(err);
+            }
+            if (!user) {
+                user = new models.user({
+                    uid: ldapEntry[self.config.ldap.field_mappings.uid],
+                    email: ldapEntry[self.config.ldap.field_mappings.email],
+                    firstName: ldapEntry[self.config.ldap.field_mappings.firstName],
+                    lastName: ldapEntry[self.config.ldap.field_mappings.lastName],
+                    displayName: ldapEntry[self.config.ldap.field_mappings.displayName]
+                });
+                user.save(function (err, user) {
+                    if (err) {
+                        return callback(err);
+                    }
+                    if (self.config.kerberos.enabled) {
+                        return callback(null, user, self.config.kerberos.realm);
+                    } else {
+                        return callback(null, user);
+                    }
+                });
+            } else {
+                if (self.config.kerberos.enabled) {
+                    return callback(null, user, self.config.kerberos.realm);
+                } else {
+                    return callback(null, user);
+                }
+            }
+        });
+    };
+
+    //LDAP sanitization
+    var sanitizeLDAP = function (ldapString) {
+        return ldapString.replace(/[*\(\)\\\u0000!&|:~]{1}/g, function (match) {
+            var cleanChar = match.charCodeAt(0).toString(16);
+            return '\\' + (cleanChar.length === 1 ? '0': '') + cleanChar;
+        });
+    };
+
+    // LDAP Authorization
+    var ldapAuthorization = function (username, done) {
+        try {
+            var client = ldap.createClient(self.config.ldap.connect_settings);
+
+            client.bind(self.config.ldap.bind_options.bindDN,
+                        self.config.ldap.bind_options.bindCredentials, function (err) {
+
+                if (err) {
+                    return done(err);
+                }
+
+                var clientOpts = _.clone(self.config.ldap.search.opts);
+                var filter = clientOpts.filter.replace(/{{username}}/g, sanitizeLDAP(username));
+                clientOpts.filter = filter;
+
+                client.search(self.config.ldap.search.base, clientOpts, function (err, res) {
+                    if (err) {
+                        console.log('search error: ' + err);
+                        return done(err);
+                    }
+
+                    var foundUsers = [];
+                    res.on('searchEntry', function (entry) {
+                        foundUsers.push(entry.object);
+                    });
+                    res.on('error', function (err) {
+                        if (err) {
+                            return done(err);
+                        }
+                    });
+                    res.on('end', function (result) {
+                        if (result.status !== 0) {
+                            var err = new Error('non-zero status from LDAP search: ' + result.status);
+                            return done(err);
+                        }
+                        switch (foundUsers.length) {
+                        case 0:
+                            return done();
+                        case 1:
+                            findOrCreateFromLDAP(foundUsers[0], done);
+                            break;
+                        default:
+                            return done(new Error(format(
+                                'unexpected number of matches (%s) for "%s" username',
+                                foundUsers.length, username)));
+                        }
+
+                        if (self.config.ldap.connect_settings.maxConnections === undefined) {
+                            client.unbind();
+                        }
+                    });
+
+                });
+
+            });
+        } catch (err) {
+            return done(err);
+        }
+    };
 
     // Authentication
     passport.use(new KerberosStrategy({
             usernameField: 'email',
             passwordField: 'password'
         },
-        function (uid, done) {
-            models.user.findOne({ uid: uid }, function (err, user) {
+        function (username, done) {
+            models.user.findOne({
+                uid: username
+            }, function (err, user) {
                 if (err) {
                     return done(err);
                 }
-                if (!user && self.config.ldap_config.enabled) {
-                    var ldap = new LDAP(self.config.ldap_config.ldap_connect_settings);
-                    ldap.open();
-                    ldap.simplebind(self.config.ldap_config.ldap_bind_options, function (err) {
-                        if (err) {
-                            return done(err);
-                        }
-                        var search_options = _.clone(self.config.ldap_config.ldap_search_options);
-                        search_options.filter = 'uid=' + uid;
-                        ldap.search(search_options, function (err, data) {
-                            if (err) {
-                                return done(err);
-                            }
-                            if (data !== undefined && data[0] !== undefined) {
-                                var user = models.user.findOne({
-                                    'email': data[0][self.config.ldap_config.ldap_field_mappings.email]
-                                }, function (err, user) {
-                                    if (err) {
-                                        return done(err);
-                                    }
-                                    if (!user) {
-                                        user = new models.user({
-                                            uid: uid,
-                                            email: data[0][self.config.ldap_config.ldap_field_mappings.email],
-                                            firstName: data[0][self.config.ldap_config.ldap_field_mappings.firstName],
-                                            lastName: data[0][self.config.ldap_config.ldap_field_mappings.lastName],
-                                            displayName: data[0][self.config.ldap_config.ldap_field_mappings.displayName]
-                                        });
-                                    } else {
-                                        user.uid = uid;
-                                    }
-                                    user.save(function (err, user) {
-                                        if (err) {
-                                            return done(err);
-                                        }
-                                        return done(null, user, self.config.kerberos_config.realm);
-                                    });
-                                });
-                            } else {
-                                return done(null, user, self.config.realm);
-                            }
-                        });
-                    });
+                if (self.config.ldap.authorization) {
+                    return ldapAuthorization(username, done);
                 } else {
-                    return done(null, user, self.config.realm);
+                    return done(null, user, self.config.kerberos.realm);
                 }
             });
         }
     ));
 
+    if (self.config.ldap.authenticate) {
+        var LDAPStrategy = require('passport-ldapauth').Strategy;
+        passport.use(new LDAPStrategy({
+                server: {
+                    url: self.config.ldap.connect_settings.url,
+                    tlsOptions: self.config.ldap.connect_settings.tlsOptions,
+                    adminDn: self.config.ldap.bind_options.bindDN,
+                    adminPassword: self.config.ldap.bind_options.bindCredentials,
+                    searchBase: self.config.ldap.search.base,
+                    searchFilter: self.config.ldap.search.opts.filter,
+                    searchAttributes: self.config.ldap.search.opts.attributes,
+                    searchScope: self.config.ldap.search.opts.scope
+                },
+                usernameField: 'email',
+                passwordField: 'password'
+            },
+            function (user, done) {
+                return findOrCreateFromLDAP(user, done);
+            }
+        ));
+    }
+
     passport.use(new LocalStrategy({
             usernameField: 'email',
             passwordField: 'password'
         },
-        function(email, password, done) {
+        function (email, password, done) {
             models.user.findOne({
                 'email': email
-            }).exec(function(err, user) {
+            }).exec(function (err, user) {
                 if (err) {
                     return done(null, false,  { message: 'Some fields did not validate.' });
                 }
-                var hashedPassword = hash.sha256(password, self.config.password_salt)
+                var hashedPassword = hash.sha256(password, self.config.password_salt);
                 if (user && hashedPassword === user.password) {
-                    return done(null, user);
+                    if (self.config.ldap.authorization) {
+                        return ldapAuthorization(email, done);
+                    } else {
+                        return done(null, user);
+                    }
                 } else {
                     return done(null, false, { message: 'Incorrect password.' });
                 }
             });
         }
     ));
+
     passport.serializeUser(function(user, done) {
         done(null, user._id);
     });
@@ -253,15 +354,9 @@ var Server = function(config) {
     // Ajax
     //
     self.app.namespace('/ajax', function() {
-        //
-        // Kerberos Login
-        //
-        self.app.post('/login', function(req, res, next) {
-            if (!self.config.kerberos_config.enabled){
-                next();
-                return;
-            }
-            passport.authenticate('kerberos', function(err, user, info) {
+
+        var authenticationCallback = function(req, res, next){
+            return function(err, user, info) {
                 if (err) {
                     res.send({
                         status: 'error',
@@ -270,7 +365,7 @@ var Server = function(config) {
                     });
                     return;
                 }
-                if (!user) {
+                if (!user && next !== undefined) {
                     next();
                     return;
                 }
@@ -287,38 +382,23 @@ var Server = function(config) {
                         message: 'Logging you in...'
                     });
                 });
-            })(req, res, next);
+            }
+        };
+
+        self.app.post('/login', function(req, res, next) {
+            if (!self.config.kerberos.enabled){
+                next();
+                return;
+            }
+            passport.authenticate('kerberos', authenticationCallback(req, res, next))(req, res, next);
+        }, function(req, res, next) {
+            if (!self.config.ldap.authenticate){
+                next();
+                return;
+            }
+            passport.authenticate('ldapauth', authenticationCallback(req, res, next))(req, res, next);
         }, function(req, res) {
-            passport.authenticate('local', function(err, user, info) {
-                if (err) {
-                    res.send({
-                        status: 'error',
-                        message: 'Some fields did not validate',
-                        errors: err
-                    });
-                    return;
-                }
-                if (!user) {
-                    res.send({
-                        status: 'error',
-                        message: 'Incorrect login credentials.'
-                    });
-                    return;
-                }
-                req.login(user, function(err) {
-                    if (err) {
-                        res.send({
-                            status: 'error',
-                            message: 'There were problems logging you in.'
-                        });
-                        return;
-                    }
-                    res.send({
-                        status: 'success',
-                        message: 'Logging you in...'
-                    });
-                });
-            })(req, res);
+            passport.authenticate('local', authenticationCallback(req, res))(req, res);
         });
 
         //

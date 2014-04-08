@@ -32,41 +32,43 @@ var config = {
     password_salt: 'Hello. Yes, This is Dog',
 
     //Kerberos Authentication
-    kerberos_config: {
+    kerberos: {
         enabled: true,
         realm: 'mordor',
     },
 
-    //LDAP for authorization
-    ldap_config: {
-        enabled: true,
-
-        ldap_connect_settings: {
-            uri: 'ldaps://your.ldap.server',
-            // Replace with your appropriate LDAP version
-            version: 3,
-            connecttimeout: 1
+    //LDAP Authorization
+    ldap: {
+        authentication: true,
+        authorization: true,
+        connect_settings: {
+            url: '',
+            tlsOptions: {}
         },
 
-        ldap_bind_options: {
-            binddn: '',
-            password: ''
+        server_certs: [],
+
+        bind_options: {
+            bindDN: '',
+            bindCredentials: ''
         },
 
-        ldap_search_options: {
+        search: {
             base: '',
-            scope: '',
-            filter: '',
-            attrs: ''
+            opts: {
+                scope: '',
+                filter: '',
+                attributes: []
+            }
         },
 
-        ldap_field_mappings: {
+        field_mappings: {
+            uid: '',
             firstName: '',
             lastName: '',
             displayName: '',
-            mail: ''
+            email: ''
         }
-
     },
 
     // Misc
