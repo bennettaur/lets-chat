@@ -71,6 +71,10 @@ var config = {
         }
     },
 
+    local: {
+        enabled: true
+    },
+
     // Misc
     debug: false,
     media_url: '/media',
